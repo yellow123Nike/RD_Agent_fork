@@ -1,9 +1,7 @@
 """
-CLI entrance for all rdagent application.
+RD-Agent 命令行总入口：注册各子命令，并在最前加载当前目录下的 `.env`。
 
-This will
-- make rdagent a nice entry and
-- autoamtically load dotenv
+Typer 应用实例为 `app`，由 `pyproject.toml` 的 `rdagent` 脚本指向本模块。
 """
 
 import sys
@@ -11,8 +9,7 @@ import sys
 from dotenv import load_dotenv
 
 load_dotenv(".env")
-# 1) Make sure it is at the beginning of the script so that it will load dotenv before initializing BaseSettings.
-# 2) The ".env" argument is necessary to make sure it loads `.env` from the current directory.
+# 须在任何依赖 BaseSettings / 环境变量的 import 之前执行；显式 ".env" 表示从当前工作目录加载。
 
 import subprocess
 from importlib.resources import path as rpath
@@ -36,6 +33,7 @@ from rdagent.log.mle_summary import grade_summary as grade_summary
 
 app = typer.Typer()
 
+# 使用 Annotated + typer.Option 定义可选参数
 CheckoutOption = Annotated[bool, typer.Option("--checkout/--no-checkout", "-c/-C")]
 CheckEnvOption = Annotated[bool, typer.Option("--check-env/--no-check-env", "-e/-E")]
 CheckDockerOption = Annotated[bool, typer.Option("--check-docker/--no-check-docker", "-d/-D")]
@@ -43,9 +41,7 @@ CheckPortsOption = Annotated[bool, typer.Option("--check-ports/--no-check-ports"
 
 
 def ui(port=19899, log_dir="", debug: bool = False, data_science: bool = False):
-    """
-    start web app to show the log traces.
-    """
+    """启动 Streamlit 日志/轨迹 Web UI；`data_science=True` 时使用数据科学专用页面。"""
     if data_science:
         with rpath("rdagent.log.ui", "dsapp.py") as app_path:
             cmds = ["streamlit", "run", app_path, f"--server.port={port}"]
@@ -63,18 +59,14 @@ def ui(port=19899, log_dir="", debug: bool = False, data_science: bool = False):
 
 
 def server_ui(port=19899):
-    """
-    start the Flask log server in real time
-    """
+    """启动 Flask 实时日志服务（非 Streamlit）。"""
     from rdagent.log.server.app import main as log_server_main
 
     log_server_main(port=port)
 
 
 def ds_user_interact(port=19900):
-    """
-    start web app to show the log traces in real time
-    """
+    """启动数据科学场景下的实时交互 Streamlit 页面。"""
     commands = ["streamlit", "run", "rdagent/log/ui/ds_user_interact.py", f"--server.port={port}"]
     subprocess.run(commands)
 
@@ -188,6 +180,7 @@ def health_check_cli(
     check_docker: CheckDockerOption = True,
     check_ports: CheckPortsOption = True,
 ):
+    """CLI：`rdagent health_check`，转调 `rdagent.app.utils.health_check.health_check`。"""
     health_check(check_env=check_env, check_docker=check_docker, check_ports=check_ports)
 
 

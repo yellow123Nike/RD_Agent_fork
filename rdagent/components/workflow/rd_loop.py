@@ -1,6 +1,8 @@
 """
-Model workflow with session control
-It is from `rdagent/app/qlib_rd_loop/model.py` and try to replace `rdagent/app/qlib_rd_loop/RDAgent.py`
+量化 / 通用 R&D 工作流：在 LoopBase 上组装「假设 → 实验 → 编码 → 执行 → 反馈 → 记录」。
+
+由 `BasePropSetting` 注入 Scenario、HypothesisGen、Hypothesis2Experiment、Coder、Runner、Summarizer；
+因子 / 模型等场景通过不同 PropSetting 复用本类或子类（如 FactorRDLoop）。
 """
 
 import asyncio
@@ -29,6 +31,11 @@ from rdagent.utils.workflow import LoopBase, LoopMeta
 
 
 class RDLoop(LoopBase, metaclass=LoopMeta):
+    """
+    标准研发循环：direct_exp_gen → coding → running → feedback → record。
+
+    `direct_exp_gen` 内联「提出假设 + 生成实验」；`plan` 保存基准因子等，供 UI 或命令行预填。
+    """
 
     def __init__(self, PROP_SETTING: BasePropSetting):
         scen: Scenario = import_class(PROP_SETTING.scen)()
@@ -44,7 +51,7 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
         self.plan: ExperimentPlan = {
             "features": ALPHA20,
             "feature_codes": {},
-        }  # for user interaction
+        }  # 用户交互或 CLI 可覆盖的基准特征与代码
 
         self.hypothesis2experiment: Hypothesis2Experiment = (
             import_class(PROP_SETTING.hypothesis2experiment)()
@@ -67,12 +74,16 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
         self.trace = Trace(scen=scen)
         super().__init__()
 
-    # excluded steps
     def _set_interactor(self, user_request_q: Queue, user_response_q: Queue):
+        """注入人机交互队列：请求 / 响应，用于 Streamlit 等侧改写 plan、假设、反馈。"""
         self.user_request_q = user_request_q
         self.user_response_q = user_response_q
 
     def _init_base_features(self, base_features_path: str | None):
+        """
+        从目录加载基准因子：可选 `base_factors.json`（Qlib 表达式 dict）与同目录下 `.py` 因子代码。
+        校验通过后写入 `plan["features"]` / `plan["feature_codes"]`。
+        """
         if base_features_path is not None:
             try:
                 base_dir = Path(base_features_path)
@@ -110,6 +121,7 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
             logger.info("No base features path provided. Using default features.")
 
     def _interact_init_params(self) -> None:
+        """若已设置交互队列，则向用户索取初始指令与基准特征表，直到 Qlib 表达式校验通过。"""
         if not (hasattr(self, "user_request_q") and hasattr(self, "user_response_q")):
             return
 
@@ -152,6 +164,7 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
         logger.info("Received user interaction on initial parameters.")
 
     def _interact_hypo(self, hypo: Hypothesis) -> Hypothesis:
+        """可选：将当前假设发给用户编辑后再继续。"""
         if not (hasattr(self, "user_request_q") and hasattr(self, "user_response_q")):
             return hypo
 
@@ -167,6 +180,7 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
         return modified_hypo
 
     def _interact_feedback(self, feedback: HypothesisFeedback) -> HypothesisFeedback:
+        """可选：将反馈发给用户确认或修改。"""
         if not (hasattr(self, "user_request_q") and hasattr(self, "user_response_q")):
             return feedback
 
@@ -182,21 +196,26 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
         return modified_feedback
 
     def _propose(self):
+        """调用 HypothesisGen，并可经人机交互改写假设。"""
         hypothesis = self.hypothesis_gen.gen(self.trace, self.plan)
 
-        # user can change the hypothesis here
         hypothesis = self._interact_hypo(hypothesis)
 
         logger.log_object(hypothesis, tag="hypothesis generation")
         return hypothesis
 
     def _exp_gen(self, hypothesis: Hypothesis):
+        """将假设转为 Experiment（子任务列表等）。"""
         exp = self.hypothesis2experiment.convert(hypothesis, self.trace)
         logger.log_object(exp.sub_tasks, tag="experiment generation")
         return exp
 
-    # included steps
     async def direct_exp_gen(self, prev_out: dict[str, Any]):
+        """
+        工作流第一步：在并行度允许时生成假设与实验，并注入 `plan` 中的基准特征。
+
+        返回 `{"propose": hypo, "exp_gen": exp}` 供后续 `coding` 使用。
+        """
         while True:
             if self.get_unfinished_loop_cnt(self.loop_idx) < RD_AGENT_SETTINGS.get_max_parallel():
                 hypo = self._propose()
@@ -210,17 +229,22 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
             await asyncio.sleep(1)
 
     def coding(self, prev_out: dict[str, Any]):
+        """根据实验规格生成/修改代码（Coder.develop）。"""
         exp = self.coder.develop(prev_out["direct_exp_gen"]["exp_gen"])
         logger.log_object(exp.sub_workspace_list, tag="coder result")
         return exp
 
     def running(self, prev_out: dict[str, Any]):
+        """执行实验（Runner.develop），如 Qlib 回测。"""
         exp = self.runner.develop(prev_out["coding"])
         logger.log_object(exp, tag="runner result")
         return exp
 
     def feedback(self, prev_out: dict[str, Any]):
-        # TODO: the logic branch of exception should be moved to summarizer
+        """
+        根据运行结果生成 HypothesisFeedback；若步骤中曾捕获 skip 类异常则构造否定反馈。
+        TODO: 异常分支逻辑宜下沉到 summarizer。
+        """
         e = prev_out.get(self.EXCEPTION_KEY, None)
         if e is not None:
             feedback = HypothesisFeedback(
@@ -236,6 +260,7 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
         return feedback
 
     def record(self, prev_out: dict[str, Any]):
+        """将 (experiment, feedback) 写入 Trace，形成 DAG / 历史供下一轮假设使用。"""
         feedback = prev_out["feedback"]
         exp = prev_out.get("running") or prev_out.get("coding") or prev_out.get("direct_exp_gen", {}).get("exp_gen")
         self.trace.sync_dag_parent_and_hist((exp, feedback), prev_out[self.LOOP_IDX_KEY])

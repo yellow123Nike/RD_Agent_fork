@@ -1,11 +1,7 @@
 """
-This is a class that try to store/resume/traceback the workflow session
+异步多 Loop 工作流引擎：会话落盘 / 恢复、步骤调度、并行信号量与计时。
 
-
-Postscripts:
-- Originally, I want to implement it in a more general way with python generator.
-  However, Python generator is not picklable (dill does not support pickle as well)
-
+说明：曾考虑用 Python generator 表达流程，但 generator 难以 pickle，故采用显式步骤列表 + LoopMeta 收集方法名。
 """
 
 import asyncio
@@ -31,44 +27,30 @@ from rdagent.utils.workflow.tracking import WorkflowTracker
 
 
 class LoopMeta(type):
+    """
+    元类：合并基类与当前类中「可作为工作流步骤」的公开方法名，写入 `cls.steps`（顺序即执行顺序）。
+
+    排除 `_` 前缀、`load`/`dump` 及嵌套 class，避免把普通工具方法误认为步骤。
+    """
 
     @staticmethod
     def _get_steps(bases: tuple[type, ...]) -> list[str]:
-        """
-        Recursively get all the `steps` from the base classes and combine them into a single list.
-
-        Args:
-            bases (tuple): A tuple of base classes.
-
-        Returns:
-            List[Callable]: A list of steps combined from all base classes.
-        """
+        """递归收集基类链上已注册的 `steps`，去重并排除 load/dump。"""
         steps = []
         for base in bases:
             for step in LoopMeta._get_steps(base.__bases__) + getattr(base, "steps", []):
-                if step not in steps and step not in ["load", "dump"]:  # incase user override the load/dump method
+                if step not in steps and step not in ["load", "dump"]:  # 避免把 load/dump 当作一步
                     steps.append(step)
         return steps
 
     def __new__(mcs, clsname: str, bases: tuple[type, ...], attrs: dict[str, Any]) -> Any:
-        """
-        Create a new class with combined steps from base classes and current class.
-
-        Args:
-            clsname (str): Name of the new class.
-            bases (tuple): Base classes.
-            attrs (dict): Attributes of the new class.
-
-        Returns:
-            LoopMeta: A new instance of LoopMeta.
-        """
-        steps = LoopMeta._get_steps(bases)  # all the base classes of parents
+        """构造类对象时汇总 `steps`：先继承基类步骤，再追加本类新增的公开可调用方法。"""
+        steps = LoopMeta._get_steps(bases)  # 基类步骤
         for name, attr in attrs.items():
             if not name.startswith("_") and callable(attr) and not isinstance(attr, type):
-                # NOTE: `not isinstance(attr, type)` is trying to exclude class type attribute
-                if name not in steps and name not in ["load", "dump"]:  # incase user override the load/dump method
-                    # NOTE: if we override the step in the subclass
-                    # Then it is not the new step. So we skip it.
+                # 排除嵌套 class（type）
+                if name not in steps and name not in ["load", "dump"]:  # 同上
+                    # 子类若覆写同名步骤，不重复追加（name 已在 steps）
                     steps.append(name)
         attrs["steps"] = steps
         return super().__new__(mcs, clsname, bases, attrs)
@@ -76,80 +58,78 @@ class LoopMeta(type):
 
 @dataclass
 class LoopTrace:
-    start: datetime  # the start time of the trace
-    end: datetime  # the end time of the trace
-    step_idx: int
-    # TODO: more information about the trace
+    """单次步骤执行的时间记录（用于会话截断与统计）。"""
+
+    start: datetime  # 该步开始时间（UTC）
+    end: datetime  # 该步结束时间（UTC）
+    step_idx: int  # 步骤在 self.steps 中的下标
+    # TODO: 可扩展更多 trace 字段
 
 
 class LoopBase:
     """
-    Assumption:
-    - The last step is responsible for recording information!!!!
+    多 Loop 并行工作流基类：kickoff 与 execute 协程配合 asyncio.Queue 调度各 loop 的步骤。
 
-    Unsolved problem:
-    - Global variable synchronization when `force_subproc` is True
-        - Timer
+    约定：最后一步（通常为 record）负责写入全局可追溯状态；`force_subproc` 为 True 时子进程与 Timer 等全局状态同步仍需谨慎。
     """
 
-    steps: list[str]  # a list of steps to work on
+    steps: list[str]  # 步骤方法名有序列表，由 LoopMeta 生成
     loop_trace: dict[int, list[LoopTrace]]
 
-    skip_loop_error: tuple[type[BaseException], ...] = ()  # you can define a list of error that will skip current loop
-    skip_loop_error_stepname: str | None = None  # if skip_loop_error exception happens, what's the next step to work on
+    skip_loop_error: tuple[type[BaseException], ...] = ()  # 捕获此类异常时跳过当前 loop 的后续逻辑或跳到指定步
+    skip_loop_error_stepname: str | None = None  # 跳过异常后强制从该步骤名继续（须晚于当前步）
     withdraw_loop_error: tuple[
         type[BaseException], ...
-    ] = ()  # you can define a list of error that will withdraw current loop
+    ] = ()  # 捕获此类异常时回滚到上一 loop 的会话快照
 
-    EXCEPTION_KEY = "_EXCEPTION"
-    LOOP_IDX_KEY = "_LOOP_IDX"
-    SENTINEL = -1
+    EXCEPTION_KEY = "_EXCEPTION"  # loop_prev_out 中存放步骤异常的键
+    LOOP_IDX_KEY = "_LOOP_IDX"  # 当前 loop 下标，注入各步输入 dict
+    SENTINEL = -1  # 队列结束标记，通知 execute_loop 退出
 
-    _pbar: tqdm  # progress bar instance
+    _pbar: tqdm  # tqdm 进度条实例（惰性创建）
 
     class LoopTerminationError(Exception):
-        """Exception raised when loop conditions indicate the loop should terminate"""
+        """步数用尽、计时器超时等正常停止条件。"""
 
     class LoopResumeError(Exception):
-        """Exception raised when loop conditions indicate the loop should stop all coroutines and resume"""
+        """需要撤销当前进度并重启所有协程时抛出（如 withdraw 后）。"""
 
     def __init__(self) -> None:
-        # progress control
-        self.loop_idx: int = 0  # current loop index / next loop index to kickoff
-        self.step_idx: defaultdict[int, int] = defaultdict(int)  # dict from loop index to next step index
+        # 调度状态
+        self.loop_idx: int = 0  # 下一个待 kickoff 的 loop 编号
+        self.step_idx: defaultdict[int, int] = defaultdict(int)  # 每个 loop 下一个待执行步骤下标
         self.queue: asyncio.Queue[Any] = asyncio.Queue()
 
-        # Store step results for all loops in a nested dictionary, following information will be stored:
-        # - loop_prev_out[loop_index][step_name]: the output of the step function
-        # - loop_prev_out[loop_index][<special keys like LOOP_IDX_KEY or EXCEPTION_KEY>]: the special keys
+        # 嵌套字典：loop_prev_out[li][step_name] = 该步返回值；另含 LOOP_IDX_KEY、EXCEPTION_KEY 等
         self.loop_prev_out: dict[int, dict[str, Any]] = defaultdict(dict)
-        self.loop_trace = defaultdict(list[LoopTrace])  # the key is the number of loop
+        self.loop_trace = defaultdict(list[LoopTrace])  # 键为 loop 编号
         self.session_folder = Path(LOG_SETTINGS.trace_path) / "__session__"
         self.timer: RDAgentTimer = RD_Agent_TIMER_wrapper.timer
-        self.tracker = WorkflowTracker(self)  # Initialize tracker with this LoopBase instance
+        self.tracker = WorkflowTracker(self)  # MLflow 等可选追踪
 
-        # progress control
-        self.loop_n: Optional[int] = None  # remain loop count
-        self.step_n: Optional[int] = None  # remain step count
+        # run() 可设置的剩余配额
+        self.loop_n: Optional[int] = None  # 剩余可启动的 loop 次数（None 表示不限制）
+        self.step_n: Optional[int] = None  # 剩余可向前推进的步数（全局递减）
 
-        self.semaphores: dict[str, asyncio.Semaphore] = {}
+        self.semaphores: dict[str, asyncio.Semaphore] = {}  # 按步骤名缓存信号量
 
     def get_unfinished_loop_cnt(self, next_loop: int) -> int:
+        """统计编号小于 next_loop 且尚未跑完所有步骤的 loop 数量（用于背压/限流）。"""
         n = 0
         for li in range(next_loop):
-            if self.step_idx[li] < len(self.steps):  # unfinished loop
+            if self.step_idx[li] < len(self.steps):  # 该 loop 仍有未执行步骤
                 n += 1
         return n
 
     def get_semaphore(self, step_name: str) -> asyncio.Semaphore:
-        if isinstance(limit := RD_AGENT_SETTINGS.step_semaphore, dict):
-            limit = limit.get(step_name, 1)  # default to 1 if not specified
+        """
+        返回该步骤名的 asyncio 并发许可。`RD_AGENT_SETTINGS.step_semaphore` 可为全局 int 或按步骤名的 dict。
 
-        # NOTE:
-        # (1) we assume the record step is always the last step to modify the global environment,
-        #     so we set the limit to 1 to avoid race condition
-        # (2) Because we support (-1,) as local selection; So it is hard to align a) the comparision target in `feedbck`
-        #     and b) parent node in `record`; So we prevent parallelism in `feedback` and `record` to avoid inconsistency
+        `feedback` 与 `record` 强制为 1：最后一步会改全局 Trace；反馈步与父节点对齐复杂，避免并行导致不一致。
+        """
+        if isinstance(limit := RD_AGENT_SETTINGS.step_semaphore, dict):
+            limit = limit.get(step_name, 1)  # 未配置则默认 1
+
         if step_name in ("record", "feedback"):
             limit = 1
 
@@ -159,7 +139,7 @@ class LoopBase:
 
     @property
     def pbar(self) -> tqdm:
-        """Progress bar property that initializes itself if it doesn't exist."""
+        """懒创建 tqdm 进度条（按步骤总数）。"""
         if getattr(self, "_pbar", None) is None:
             self._pbar = tqdm(total=len(self.steps), desc="Workflow Progress", unit="step")
         return self._pbar
@@ -170,20 +150,14 @@ class LoopBase:
             del self._pbar
 
     def _check_exit_conditions_on_step(self, loop_id: Optional[int] = None, step_id: Optional[int] = None) -> None:
-        """Check if the loop should continue or terminate.
-
-        Raises
-        ------
-        LoopTerminationException
-            When conditions indicate that the loop should terminate
-        """
-        # Check step count limitation
+        """每成功前进一步后调用：递减 step_n 或检查计时器；不满足则抛 LoopTerminationError。"""
+        # 全局剩余步数
         if self.step_n is not None:
             if self.step_n <= 0:
                 raise self.LoopTerminationError("Step count reached")
             self.step_n -= 1
 
-        # Check timer timeout
+        # 总时长计时器
         if self.timer.started:
             if self.timer.is_timeout():
                 logger.warning("Timeout, exiting the loop.")
@@ -192,20 +166,10 @@ class LoopBase:
                 logger.info(f"Timer remaining time: {self.timer.remain_time()}")
 
     async def _run_step(self, li: int, force_subproc: bool = False) -> None:
-        """Execute a single step (next unrun step) in the workflow (async version with force_subproc option).
+        """
+        执行 loop `li` 的当前一步：从 `self.steps[step_idx]` 取方法名，调用实例方法并写回 `loop_prev_out`。
 
-        Parameters
-        ----------
-        li : int
-            Loop index
-
-        force_subproc : bool
-            Whether to force the step to run in a subprocess in asyncio
-
-        Returns
-        -------
-        Any
-            The result of the step function
+        force_subproc 为 True 时用 ProcessPoolExecutor 深拷贝后执行同步函数，避免阻塞事件循环（注意与 Timer 全局状态）。
         """
         si = self.step_idx[li]
         name = self.steps[si]
@@ -221,28 +185,22 @@ class LoopBase:
 
                 next_step_idx = si + 1
                 step_forward = True
-                # NOTE: each step are aware are of current loop index
-                # It is very important to set it before calling the step function!
+                # 各步可通过 prev_out[LOOP_IDX_KEY] 获知当前 loop 编号；须在调用步骤函数前写入
                 self.loop_prev_out[li][self.LOOP_IDX_KEY] = li
 
                 try:
-                    # Call function with current loop's output, await if coroutine or use ProcessPoolExecutor for sync if required
                     if force_subproc:
                         curr_loop = asyncio.get_running_loop()
                         with concurrent.futures.ProcessPoolExecutor() as pool:
-                            # Using deepcopy is to avoid triggering errors like "RuntimeError: dictionary changed size during iteration"
-                            # GUESS: Some content in self.loop_prev_out[li] may be in the middle of being changed.
+                            # 深拷贝避免子进程与主进程并发修改同一 dict 导致迭代中结构变化
                             result = await curr_loop.run_in_executor(
                                 pool, copy.deepcopy(func), copy.deepcopy(self.loop_prev_out[li])
                             )
                     else:
-                        # auto determine whether to run async or sync
                         if asyncio.iscoroutinefunction(func):
                             result = await func(self.loop_prev_out[li])
                         else:
-                            # Default: run sync function directly
                             result = func(self.loop_prev_out[li])
-                    # Store result in the nested dictionary
                     self.loop_prev_out[li][name] = result
                 except Exception as e:
                     if isinstance(e, self.skip_loop_error):
@@ -254,7 +212,7 @@ class LoopBase:
                                     f"Cannot skip backwards or to same step. Current: {si} ({name}), Target: {next_step_idx} ({self.skip_loop_error_stepname})"
                                 ) from e
                         else:
-                            # Default: jump to feedback step if exists, otherwise jump to the last step (record)
+                            # 默认跳到 feedback，否则最后一步（一般为 record）
                             if "feedback" in self.steps:
                                 next_step_idx = self.steps.index("feedback")
                             else:
@@ -263,7 +221,6 @@ class LoopBase:
                         self.loop_prev_out[li][self.EXCEPTION_KEY] = e
                     elif isinstance(e, self.withdraw_loop_error):
                         logger.warning(f"Withdraw loop {li} due to {e}")
-                        # Back to previous loop
                         self.withdraw_loop(li)
                         step_forward = False
 
@@ -272,9 +229,6 @@ class LoopBase:
                     else:
                         raise  # re-raise unhandled exceptions
                 finally:
-                    # No matter the execution succeed or not, we have to finish the following steps
-
-                    # Record the trace
                     end = datetime.now(timezone.utc)
                     self.loop_trace[li].append(LoopTrace(start, end, step_idx=si))
                     logger.log_object(
@@ -285,10 +239,8 @@ class LoopBase:
                         tag="time_info",
                     )
                     if step_forward:
-                        # Increment step index
                         self.step_idx[li] = next_step_idx
 
-                        # Update progress bar
                         current_step = self.step_idx[li]
                         self.pbar.n = current_step
                         next_step = self.step_idx[li] % len(self.steps)
@@ -298,12 +250,8 @@ class LoopBase:
                             step_name=self.steps[next_step],
                         )
 
-                        # Save snapshot after completing the step;
-                        # 1) It has to be after the step_idx is updated, so loading the snapshot will be on the right step.
-                        # 2) Only save it when the step forward, withdraw does not worth saving.
+                        # 成功前进一步后再 dump：保证恢复时 step_idx 与 pickle 一致；withdraw 不保存
                         if name in self.loop_prev_out[li]:
-                            # 3) Only dump the step if (so we don't have to redo the step when we load the session again)
-                            # it has been executed successfully
                             self.dump(self.session_folder / f"{li}" / f"{si}_{name}")
 
                         self._check_exit_conditions_on_step(loop_id=li, step_id=si)
@@ -311,10 +259,10 @@ class LoopBase:
                         logger.warning(f"Step forward {si} of loop {li} is skipped.")
 
     async def kickoff_loop(self) -> None:
+        """不断递增 loop_idx：在 loop_n 限额内为每个新 loop 先跑第 0 步（通常为实验生成），再丢进队列。"""
         while True:
             li = self.loop_idx
 
-            # exit on loop limitation
             if self.loop_n is not None:
                 if self.loop_n <= 0:
                     for _ in range(RD_AGENT_SETTINGS.get_max_parallel()):
@@ -322,46 +270,34 @@ class LoopBase:
                     break
                 self.loop_n -= 1
 
-            # NOTE:
-            # Try best to kick off the first step; the first step is always the ExpGen;
-            # it have the right to decide when to stop yield new Experiment
+            # 第一步一般为实验生成，可内部阻塞直到并行度允许
             if self.step_idx[li] == 0:
-                # Assume the first step is ExpGen
-                # Only kick off ExpGen when it is never kicked off before
                 await self._run_step(li)
-            self.queue.put_nowait(li)  # the loop `li` has been kicked off, waiting for workers to pick it up
+            self.queue.put_nowait(li)  # execute_loop 侧消费并推进后续步骤
             self.loop_idx += 1
             await asyncio.sleep(0)
 
     async def execute_loop(self) -> None:
+        """从队列取 loop 编号，顺序执行该 loop 剩余步骤；末步通常不强制子进程。"""
         while True:
-            # 1) get the tasks to goon loop `li`
             li = await self.queue.get()
             if li == self.SENTINEL:
                 break
-            # 2) run the unfinished steps
             while self.step_idx[li] < len(self.steps):
                 if self.step_idx[li] == len(self.steps) - 1:
-                    # NOTE: assume the last step is record, it will be fast and affect the global environment
-                    # if it is the last step, run it directly ()
+                    # 假定最后一步为 record：快且修改全局 Trace，直接同进程执行
                     await self._run_step(li)
                 else:
-                    # await the step; parallel running happens here!
-                    # Only trigger subprocess if we have more than one process.
                     await self._run_step(li, force_subproc=RD_AGENT_SETTINGS.is_force_subproc())
 
     async def run(self, step_n: int | None = None, loop_n: int | None = None, all_duration: str | None = None) -> None:
-        """Run the workflow loop.
-
-        Parameters
-        ----------
-        loop_n: int | None
-            How many loops to run; if current loop is incomplete, it will be counted as the first loop for completion
-            `None` indicates to run forever until error or KeyboardInterrupt
-        all_duration : str | None
-            Maximum duration to run, in format accepted by the timer
         """
-        # Initialize timer if duration is provided
+        启动工作流：1 个 kickoff_loop + 多个 execute_loop（并行度由 RD_AGENT_SETTINGS.get_max_parallel()）。
+
+        loop_n：剩余可 kickoff 的 loop 次数；None 表示直到异常或手动中断。
+        step_n：全局剩余步数配额，每成功前进一步减一。
+        all_duration：总运行时长字符串，交给 RDAgentTimer 解析。
+        """
         if all_duration is not None and not self.timer.started:
             self.timer.reset(all_duration=all_duration)
 
@@ -370,17 +306,13 @@ class LoopBase:
         if loop_n is not None:
             self.loop_n = loop_n
 
-        # empty the queue when restarting
         while not self.queue.empty():
             self.queue.get_nowait()
-        self.loop_idx = (
-            0  # if we rerun the loop, we should revert the loop index to 0 to make sure every loop is correctly kicked
-        )
+        self.loop_idx = 0  # 每次 run 从 0 开始编号，保证 kickoff 顺序一致
 
         tasks: list[asyncio.Task] = []
         while True:
             try:
-                # run one kickoff_loop and execute_loop
                 tasks = [
                     asyncio.create_task(t)
                     for t in [
@@ -395,15 +327,15 @@ class LoopBase:
                 self.loop_idx = 0
             except self.LoopTerminationError as e:
                 logger.warning(f"Reach stop criterion and stop loop: {e}")
-                kill_subprocesses()  # NOTE: coroutine-based workflow can't automatically stop subprocesses.
+                kill_subprocesses()  # 协程无法自动回收 ProcessPool 子进程，需手动清理
                 break
             finally:
-                # cancel all previous tasks before resuming all loops or exit
                 for t in tasks:
                     t.cancel()
                 self.close_pbar()
 
     def withdraw_loop(self, loop_idx: int) -> None:
+        """从上一 loop 的会话目录加载最新 pickle，覆盖当前实例状态（用于 withdraw_loop_error）。"""
         prev_session_dir = self.session_folder / str(loop_idx - 1)
         prev_path = min(
             (p for p in prev_session_dir.glob("*_*") if p.is_file()),
@@ -417,13 +349,13 @@ class LoopBase:
                 replace_timer=True,
             )
             logger.info(f"Load previous session from {prev_path}")
-            # Overwrite current instance state
             self.__dict__ = loaded.__dict__
         else:
             logger.error(f"No previous dump found at {prev_session_dir}, cannot withdraw loop {loop_idx}")
             raise
 
     def dump(self, path: str | Path) -> None:
+        """将当前 Loop 实例 pickle 到 path（会先刷新计时器剩余时间）。"""
         if RD_Agent_TIMER_wrapper.timer.started:
             RD_Agent_TIMER_wrapper.timer.update_remain_time()
         path = Path(path)
@@ -432,17 +364,13 @@ class LoopBase:
             pickle.dump(self, f)
 
     def truncate_session_folder(self, li: int, si: int) -> None:
-        """
-        Clear the session folder by removing all session objects after the given loop index (li) and step index (si).
-        """
-        # clear session folders after the li
+        """删除会话目录中晚于 (li, si) 的 dump：用于 checkout 后丢弃「更晚」的快照。"""
         for sf in self.session_folder.iterdir():
             if sf.is_dir() and int(sf.name) > li:
                 for file in sf.iterdir():
                     file.unlink()
                 sf.rmdir()
 
-        # clear step session objects in the li
         final_loop_session_folder = self.session_folder / str(li)
         for step_session in final_loop_session_folder.glob("*_*"):
             if step_session.is_file():
@@ -458,27 +386,14 @@ class LoopBase:
         replace_timer: bool = True,
     ) -> "LoopBase":
         """
-        Load a session from a given path.
-        Parameters
-        ----------
-        path : str | Path
-            The path to the session file.
-        checkout : bool | Path | str
-            If True, the new loop will use the existing folder and clear logs for sessions after the one corresponding to the given path.
-            If False, the new loop will use the existing folder but keep the logs for sessions after the one corresponding to the given path.
-            If a path (or a str like Path) is provided, the new loop will be saved to that path, leaving the original path unchanged.
-        replace_timer : bool
-            If a session is loaded, determines whether to replace the timer with session.timer.
-            Default is True, which means the session timer will be replaced with the current timer.
-            If False, the session timer will not be replaced.
-        Returns
-        -------
-        LoopBase
-            An instance of LoopBase with the loaded session.
+        从 pickle 恢复会话。
+
+        path 可为具体 `.pkl` 文件，或目录（则在 `__session__` 下按 loop/step 序取最新文件）。
+        checkout=True：在原会话根继续写并截断更晚快照与日志；checkout=Path：克隆到新目录；False：不截断。
+        replace_timer：是否用会话内 timer 替换全局包装器中的 timer。
         """
         path = Path(path)
         session_folder = None
-        # if the path is a directory, load the latest session
         if path.is_dir():
             if path.name != "__session__":
                 session_folder = path / "__session__"
@@ -488,7 +403,6 @@ class LoopBase:
             if not session_folder.exists():
                 raise FileNotFoundError(f"No session file found in {path}")
 
-            # iterate the dump steps in increasing order
             files = sorted(session_folder.glob("*/*_*"), key=lambda f: (int(f.parent.name), int(f.name.split("_")[0])))
             path = files[-1]
             logger.info(f"Loading latest session from {path}")
@@ -498,13 +412,11 @@ class LoopBase:
         with path.open("rb") as f:
             session = cast(LoopBase, pickle.load(f))
 
-        # set session folder
         if checkout:
             if checkout is True:
                 session.session_folder = session_folder
                 logger.set_storages_path(session.session_folder.parent)
 
-                # truncate log storages after the max loop
                 max_loop = max(session.loop_trace.keys())
                 session.truncate_session_folder(max_loop, len(session.loop_trace[max_loop]) - 1)
                 logger.truncate_storages(session.loop_trace[max_loop][-1].end)
@@ -521,22 +433,23 @@ class LoopBase:
                 RD_Agent_TIMER_wrapper.replace_timer(session.timer)
                 RD_Agent_TIMER_wrapper.timer.restart_by_remain_time()
             else:
-                # Use the default timer to replace the session timer
                 session.timer = RD_Agent_TIMER_wrapper.timer
 
         return session
 
     def __getstate__(self) -> dict[str, Any]:
+        """pickle 时排除不可序列化的 queue、信号量、进度条与多进程 Queue。"""
         res = {}
         for k, v in self.__dict__.items():
             if k in ["queue", "semaphores", "_pbar"]:
                 continue
-            if isinstance(v, multiprocessing.queues.Queue):  # interaction queues are not picklable
+            if isinstance(v, multiprocessing.queues.Queue):
                 continue
             res[k] = v
         return res
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        """反序列化后重建空的 asyncio 队列与信号量表。"""
         self.__dict__.update(state)
         self.queue = asyncio.Queue()
         self.semaphores = {}
@@ -544,9 +457,8 @@ class LoopBase:
 
 def kill_subprocesses() -> None:
     """
-    Due to the coroutine-based nature of the workflow, the event loop of the main process can't
-    stop all the subprocesses start by `curr_loop.run_in_executor`. So we need to kill them manually.
-    Otherwise, the subprocesses will keep running in the background and the the main process keeps waiting.
+    主进程事件循环无法自动结束 `run_in_executor` 拉起的子进程；终止工作流时需遍历子进程树 terminate/kill，
+    避免僵尸任务占用资源。
     """
     current_proc = psutil.Process(os.getpid())
     for child in current_proc.children(recursive=True):
