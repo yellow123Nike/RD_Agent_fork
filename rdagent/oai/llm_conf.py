@@ -83,6 +83,9 @@ class LLMSettings(ExtendedBaseSettings):
     # Embedding configs
     embedding_openai_api_key: str = ""
     embedding_openai_base_url: str = ""
+    # Same keys as in .env.example (dedicated embedding endpoint, e.g. local vLLM)
+    litellm_proxy_api_key: str = ""
+    litellm_proxy_api_base: str = ""
     embedding_azure_api_base: str = ""
     embedding_azure_api_version: str = ""
     embedding_max_str_num: int = 50

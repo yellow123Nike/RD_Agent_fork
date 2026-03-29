@@ -79,9 +79,27 @@ class LiteLLMAPIBackend(APIBackend):
                 f"{LogColors.MAGENTA}Creating embedding{LogColors.END} for: {input_content_list}",
                 tag="debug_litellm_emb",
             )
+        api_base = (
+            LITELLM_SETTINGS.embedding_openai_base_url
+            or LITELLM_SETTINGS.litellm_proxy_api_base
+            or LITELLM_SETTINGS.openai_api_base
+        )
+        api_key = (
+            LITELLM_SETTINGS.embedding_openai_api_key
+            or LITELLM_SETTINGS.litellm_proxy_api_key
+            or LITELLM_SETTINGS.openai_api_key
+        )
+        emb_kwargs: dict[str, Any] = {}
+        if api_base:
+            emb_kwargs["api_base"] = api_base.rstrip("/")
+        if api_key:
+            emb_kwargs["api_key"] = api_key
         response = embedding(
             model=model_name,
             input=input_content_list,
+            # vLLM OpenAI-compatible server rejects JSON null; LiteLLM may send encoding_format=None
+            encoding_format="float",
+            **emb_kwargs,
         )
         response_list = [data["embedding"] for data in response.data]
         return response_list

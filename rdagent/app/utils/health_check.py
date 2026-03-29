@@ -1,5 +1,6 @@
 import os
 import socket
+from urllib.parse import urlparse
 
 import docker
 import fire
@@ -9,6 +10,40 @@ from litellm.utils import ModelResponse
 
 from rdagent.log import rdagent_logger as logger
 from rdagent.utils.env import cleanup_container
+
+
+def _normalize_api_base(base: str | None) -> str | None:
+    if base is None or base == "":
+        return None
+    return base.rstrip("/")
+
+
+def _maybe_log_connection_hint(api_base: str | None, exc: BaseException) -> None:
+    if not api_base:
+        return
+    msg = str(exc).lower()
+    markers = (
+        "connection",
+        "connect",
+        "refused",
+        "unreachable",
+        "timed out",
+        "timeout",
+        "name or service not known",
+        "getaddrinfo",
+        "errno",
+    )
+    if not any(m in msg for m in markers):
+        return
+    b = _normalize_api_base(api_base) or api_base
+    parsed = urlparse(b)
+    hostport = f"{parsed.hostname}:{parsed.port}" if parsed.hostname and parsed.port else (parsed.hostname or b)
+    logger.warning(
+        f"连通性排查: 请求未到达或无法建立连接 (api_base={b})。"
+        f"可在本机执行 `curl -sS '{b}/models'`；若失败请确认: "
+        f"1) {hostport} 上服务已启动 2) 运行健康检查的环境能路由到该地址（勿在无法访问内网的机器上测）"
+        f" 3) 防火墙 4) 监听地址为 0.0.0.0 而非仅 127.0.0.1（否则仅本机可连）。"
+    )
 
 
 def check_docker_status() -> None:
@@ -50,6 +85,7 @@ def check_and_list_free_ports(start_port=19899, max_ports=10) -> None:
 
 def test_chat(chat_model, chat_api_key, chat_api_base):
     logger.info(f"🧪 Testing chat model: {chat_model}")
+    chat_api_base = _normalize_api_base(chat_api_base)
     try:
         if chat_api_base is None:
             response: ModelResponse = completion(
@@ -72,22 +108,26 @@ def test_chat(chat_model, chat_api_key, chat_api_base):
         return True
     except Exception as e:
         logger.error(f"❌ Chat test failed: {e}")
+        _maybe_log_connection_hint(chat_api_base, e)
         return False
 
 
 def test_embedding(embedding_model, embedding_api_key, embedding_api_base):
     logger.info(f"🧪 Testing embedding model: {embedding_model}")
+    embedding_api_base = _normalize_api_base(embedding_api_base)
     try:
         response = embedding(
             model=embedding_model,
             api_key=embedding_api_key,
             api_base=embedding_api_base,
             input="Hello world!",
+            encoding_format="float",
         )
         logger.info("✅ Embedding test passed.")
         return True
     except Exception as e:
         logger.error(f"❌ Embedding test failed: {e}")
+        _maybe_log_connection_hint(embedding_api_base, e)
         return False
 
 
@@ -115,8 +155,16 @@ def env_check():
         chat_api_base = os.getenv("OPENAI_API_BASE")
         chat_model = os.getenv("CHAT_MODEL")
         embedding_model = os.getenv("EMBEDDING_MODEL")
-        embedding_api_key = chat_api_key
-        embedding_api_base = chat_api_base
+        embedding_api_key = (
+            os.getenv("EMBEDDING_OPENAI_API_KEY")
+            or os.getenv("LITELLM_PROXY_API_KEY")
+            or chat_api_key
+        )
+        embedding_api_base = (
+            os.getenv("EMBEDDING_OPENAI_BASE_URL")
+            or os.getenv("LITELLM_PROXY_API_BASE")
+            or chat_api_base
+        )
     else:
         logger.error("No valid configuration was found, please check your .env file.")
 
